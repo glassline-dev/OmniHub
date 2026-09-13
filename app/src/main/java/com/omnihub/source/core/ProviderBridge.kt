@@ -20,6 +20,7 @@ import okhttp3.OkHttpClient
 
 object ProviderBridge {
     data class StreamToken(val text: String, val done: Boolean = false)
+    private const val TOTAL_LATENCY_BUDGET_MS = 10_000L
     private val http = OkHttpClient.Builder().connectTimeout(8, TimeUnit.SECONDS).readTimeout(8, TimeUnit.SECONDS).callTimeout(10, TimeUnit.SECONDS).followRedirects(true).build()
 
     fun streamChat(context: Context, providerId: String, providerName: String, siteUrl: String, messages: List<ChatMessage>, kind: String = "WEB"): Flow<StreamToken> =
@@ -34,7 +35,10 @@ object ProviderBridge {
 
         val job = launch(Dispatchers.IO) {
             val errors = mutableListOf<String>()
+            val deadline = System.currentTimeMillis() + TOTAL_LATENCY_BUDGET_MS
             for ((id, name, url) in candidates) {
+                val remaining = deadline - System.currentTimeMillis()
+                if (remaining <= 150L) break
                 if (ProviderCooldown.isCooling(context, id)) { errors += ProviderCooldown.message(context, id, name); continue }
                 if (kind.equals("MCP", true)) { trySend(StreamToken(runMcpAction(context, id, name, url, last), true)); close(); return@launch }
                 val host = hostOf(url.ifBlank { "https://chatgpt.com" })
@@ -42,7 +46,7 @@ object ProviderBridge {
                 if (cookies.isBlank() && !ProviderAuthStore.isSignedIn(context, id)) { errors += "Not signed in to $name"; continue }
                 val lastPartial = AtomicReference("")
                 val result = try {
-                    withTimeout(10_000L) {
+                    withTimeout(remaining.coerceAtMost(9_500L)) {
                         WebViewChatEngine.send(context, url.ifBlank { "https://$host" }, id, last, onPartial = { partial ->
                             val cleaned = ReplySanitizer.strip(partial)
                             if (cleaned.isNotBlank() && cleaned != lastPartial.get()) { lastPartial.set(cleaned); trySend(StreamToken(cleaned, false)) }
@@ -64,7 +68,9 @@ object ProviderBridge {
                 }
                 trySend(StreamToken(text, true)); close(); return@launch
             }
-            trySend(StreamToken("All providers failed or are cooling down.\n" + errors.distinct().take(3).joinToString("\n"), true)); close()
+            val elapsed = TOTAL_LATENCY_BUDGET_MS
+            val message = if (errors.isEmpty()) "No provider completed within the 10s latency budget. Retry or switch source." else "No provider completed within the 10s latency budget.\n" + errors.distinct().take(3).joinToString("\n")
+            trySend(StreamToken(message, true)); close()
         }
         awaitClose { job.cancel() }
     }.flowOn(Dispatchers.IO)
@@ -77,7 +83,6 @@ object ProviderBridge {
 
     private fun looksBlocked(text: String): Boolean { val t = text.lowercase(); return t.contains("unusual activity") || t.contains("session expired or blocked") || (t.contains("cooling down") && t.contains("blocked")) }
     private fun hostOf(url: String): String = try { java.net.URI(url).host ?: url } catch (_: Exception) { url }
-
     private fun cookieHeader(context: Context, providerId: String, vararg hosts: String): String {
         val active = AccountStore.activeAccountId(context, providerId)
         val sessionKeys = listOf(AccountStore.sessionKey(providerId, active), providerId, "web_$providerId")
