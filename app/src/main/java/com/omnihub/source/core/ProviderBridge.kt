@@ -5,25 +5,26 @@ import android.webkit.CookieManager
 import com.omnihub.data.SecureStore
 import com.omnihub.providers.ChatMessage
 import com.omnihub.providers.ChatResponse
+import com.omnihub.workspace.WorkspaceAgent
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import okhttp3.OkHttpClient
 
 object ProviderBridge {
 
     data class StreamToken(val text: String, val done: Boolean = false)
 
     private val http = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(120, TimeUnit.SECONDS)
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(8, TimeUnit.SECONDS)
+        .callTimeout(10, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
 
@@ -41,10 +42,6 @@ object ProviderBridge {
         kind
     )
 
-    /**
-     * Live stream: emits cumulative cleaned text as the page grows (done=false),
-     * then a final token (done=true).
-     */
     fun streamChatWithFallback(
         context: Context,
         candidates: List<Triple<String, String, String>>,
@@ -56,12 +53,17 @@ object ProviderBridge {
             close()
             return@callbackFlow
         }
-        val last = messages.lastOrNull { it.role == "user" }?.content.orEmpty()
-        if (last.isBlank()) {
+        val original = messages.lastOrNull { it.role == "user" }?.content.orEmpty()
+        if (original.isBlank()) {
             trySend(StreamToken("Empty message.", done = true))
             close()
             return@callbackFlow
         }
+
+        // File work is converted into an explicit, bounded action protocol before
+        // it reaches the model. The response is then executed locally in OmniWorkspace.
+        val workspaceAgent = WorkspaceAgent(context)
+        val last = workspaceAgent.promptFor(original)
 
         val job = launch(Dispatchers.IO) {
             val errors = mutableListOf<String>()
@@ -103,13 +105,10 @@ object ProviderBridge {
                         }
                     )
                 } catch (e: Exception) {
-                    WebViewChatEngine.Result(
-                        e.message ?: e.javaClass.simpleName,
-                        false
-                    )
+                    WebViewChatEngine.Result(e.message ?: e.javaClass.simpleName, false)
                 }
 
-                val text = if (result.ok) {
+                var text = if (result.ok) {
                     ReplySanitizer.strip(result.text).ifBlank { result.text }
                 } else {
                     val err = result.text
@@ -131,17 +130,28 @@ object ProviderBridge {
                     continue
                 }
 
+                // Execute only the explicit <omni_actions> block. Normal model prose
+                // remains normal chat and cannot cause arbitrary filesystem writes.
+                val execution = workspaceAgent.execute(text)
+                if (execution.changed) {
+                    val human = text
+                        .replace(Regex("<omni_actions>[\\s\\S]*?</omni_actions>"), "")
+                        .trim()
+                    text = buildString {
+                        if (human.isNotBlank()) append(human).append("\n\n")
+                        append("✓ ").append(execution.summary)
+                    }
+                }
+
                 trySend(StreamToken(text, done = true))
                 close()
                 return@launch
             }
-            trySend(
-                StreamToken(
-                    "All providers failed or are cooling down.\n" +
-                        errors.distinct().take(3).joinToString("\n"),
-                    done = true
-                )
-            )
+            trySend(StreamToken(
+                "All providers failed or are cooling down.\n" +
+                    errors.distinct().take(3).joinToString("\n"),
+                done = true
+            ))
             close()
         }
 
@@ -160,11 +170,7 @@ object ProviderBridge {
         streamChat(context, providerId, providerName, siteUrl, messages, kind).collect { tok ->
             if (tok.text.isNotEmpty()) last = tok.text
         }
-        ChatResponse(
-            content = last.ifBlank { "No reply." },
-            model = providerName,
-            providerId = providerId
-        )
+        ChatResponse(content = last.ifBlank { "No reply." }, model = providerName, providerId = providerId)
     }
 
     private fun looksBlocked(text: String): Boolean {
@@ -175,42 +181,25 @@ object ProviderBridge {
     }
 
     private fun hostOf(url: String): String =
-        try {
-            java.net.URI(url).host ?: url
-        } catch (_: Exception) {
-            url
-        }
+        try { java.net.URI(url).host ?: url } catch (_: Exception) { url }
 
     private fun cookieHeader(context: Context, providerId: String, vararg hosts: String): String {
         val active = AccountStore.activeAccountId(context, providerId)
         val sessionKeys = listOf(
-            AccountStore.sessionKey(providerId, active),
-            providerId,
-            "web_$providerId"
+            AccountStore.sessionKey(providerId, active), providerId, "web_$providerId"
         )
         val stored = sessionKeys
             .mapNotNull { SecureStore.getSession(context, it) }
             .firstOrNull { it.isNotBlank() }
             .orEmpty()
-
         val liveParts = linkedSetOf<String>()
-        val cm = try {
-            CookieManager.getInstance()
-        } catch (_: Exception) {
-            null
-        }
+        val cm = try { CookieManager.getInstance() } catch (_: Exception) { null }
         if (cm != null) {
-            for (h in hosts) {
-                for (u in listOf("https://$h", "https://www.$h")) {
-                    try {
-                        val c = cm.getCookie(u).orEmpty()
-                        if (c.isNotBlank()) {
-                            c.split(";").map { it.trim() }.filter { it.contains("=") }
-                                .forEach { liveParts.add(it) }
-                        }
-                    } catch (_: Exception) {
-                    }
-                }
+            for (h in hosts) for (u in listOf("https://$h", "https://www.$h")) {
+                try {
+                    cm.getCookie(u).orEmpty().split(";").map { it.trim() }
+                        .filter { it.contains("=") }.forEach { liveParts.add(it) }
+                } catch (_: Exception) { }
             }
         }
         val live = liveParts.joinToString("; ")
@@ -251,11 +240,7 @@ object ProviderAuthStore {
 
     fun isSignedIn(context: Context, providerId: String): Boolean {
         val active = AccountStore.activeAccountId(context, providerId)
-        val keys = listOf(
-            AccountStore.sessionKey(providerId, active),
-            providerId,
-            "web_$providerId"
-        )
+        val keys = listOf(AccountStore.sessionKey(providerId, active), providerId, "web_$providerId")
         if (keys.any { !SecureStore.getSession(context, it).isNullOrBlank() }) return true
         return context.getSharedPreferences(PREFS, 0).getBoolean("signed_$providerId", false)
     }
@@ -266,9 +251,7 @@ object ProviderAuthStore {
             SecureStore.clearSession(context, providerId)
             SecureStore.clearSession(context, "web_$providerId")
             val active = AccountStore.activeAccountId(context, providerId)
-            if (!active.isNullOrBlank()) {
-                SecureStore.clearSession(context, AccountStore.sessionKey(providerId, active))
-            }
+            if (!active.isNullOrBlank()) SecureStore.clearSession(context, AccountStore.sessionKey(providerId, active))
             ProviderCooldown.clear(context, providerId)
         }
     }
