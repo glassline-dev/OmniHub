@@ -13,253 +13,89 @@ import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import okhttp3.OkHttpClient
 
 object ProviderBridge {
-
     data class StreamToken(val text: String, val done: Boolean = false)
+    private val http = OkHttpClient.Builder().connectTimeout(8, TimeUnit.SECONDS).readTimeout(8, TimeUnit.SECONDS).callTimeout(10, TimeUnit.SECONDS).followRedirects(true).build()
 
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(8, TimeUnit.SECONDS)
-        .callTimeout(10, TimeUnit.SECONDS)
-        .followRedirects(true)
-        .build()
+    fun streamChat(context: Context, providerId: String, providerName: String, siteUrl: String, messages: List<ChatMessage>, kind: String = "WEB"): Flow<StreamToken> =
+        streamChatWithFallback(context, listOf(Triple(providerId, providerName, siteUrl)), messages, kind)
 
-    fun streamChat(
-        context: Context,
-        providerId: String,
-        providerName: String,
-        siteUrl: String,
-        messages: List<ChatMessage>,
-        kind: String = "WEB"
-    ): Flow<StreamToken> = streamChatWithFallback(
-        context,
-        listOf(Triple(providerId, providerName, siteUrl)),
-        messages,
-        kind
-    )
-
-    fun streamChatWithFallback(
-        context: Context,
-        candidates: List<Triple<String, String, String>>,
-        messages: List<ChatMessage>,
-        kind: String = "WEB"
-    ): Flow<StreamToken> = callbackFlow {
-        if (candidates.isEmpty()) {
-            trySend(StreamToken("No source installed. Open Store → install → Sign in.", done = true))
-            close()
-            return@callbackFlow
-        }
+    fun streamChatWithFallback(context: Context, candidates: List<Triple<String, String, String>>, messages: List<ChatMessage>, kind: String = "WEB"): Flow<StreamToken> = callbackFlow {
+        if (candidates.isEmpty()) { trySend(StreamToken("No source installed. Open Store → install → Sign in.", true)); close(); return@callbackFlow }
         val original = messages.lastOrNull { it.role == "user" }?.content.orEmpty()
-        if (original.isBlank()) {
-            trySend(StreamToken("Empty message.", done = true))
-            close()
-            return@callbackFlow
-        }
-
-        // File work is converted into an explicit, bounded action protocol before
-        // it reaches the model. The response is then executed locally in OmniWorkspace.
+        if (original.isBlank()) { trySend(StreamToken("Empty message.", true)); close(); return@callbackFlow }
         val workspaceAgent = WorkspaceAgent(context)
         val last = workspaceAgent.promptFor(original)
 
         val job = launch(Dispatchers.IO) {
             val errors = mutableListOf<String>()
             for ((id, name, url) in candidates) {
-                if (ProviderCooldown.isCooling(context, id)) {
-                    errors += ProviderCooldown.message(context, id, name)
-                    continue
-                }
-                if (kind.equals("MCP", true)) {
-                    val mcp = runMcpAction(context, id, name, url, last)
-                    trySend(StreamToken(mcp, done = true))
-                    close()
-                    return@launch
-                }
-
+                if (ProviderCooldown.isCooling(context, id)) { errors += ProviderCooldown.message(context, id, name); continue }
+                if (kind.equals("MCP", true)) { trySend(StreamToken(runMcpAction(context, id, name, url, last), true)); close(); return@launch }
                 val host = hostOf(url.ifBlank { "https://chatgpt.com" })
-                val cookies = cookieHeader(
-                    context, id, host, host.removePrefix("www."),
-                    "chatgpt.com", "auth.openai.com"
-                )
-                if (cookies.isBlank() && !ProviderAuthStore.isSignedIn(context, id)) {
-                    errors += "Not signed in to $name"
-                    continue
-                }
-
+                val cookies = cookieHeader(context, id, host, host.removePrefix("www."), "chatgpt.com", "auth.openai.com")
+                if (cookies.isBlank() && !ProviderAuthStore.isSignedIn(context, id)) { errors += "Not signed in to $name"; continue }
                 val lastPartial = AtomicReference("")
                 val result = try {
-                    WebViewChatEngine.send(
-                        context = context,
-                        siteUrl = url.ifBlank { "https://$host" },
-                        providerId = id,
-                        userMessage = last,
-                        onPartial = { partial ->
+                    withTimeout(10_000L) {
+                        WebViewChatEngine.send(context, url.ifBlank { "https://$host" }, id, last, onPartial = { partial ->
                             val cleaned = ReplySanitizer.strip(partial)
-                            if (cleaned.isNotBlank() && cleaned != lastPartial.get()) {
-                                lastPartial.set(cleaned)
-                                trySend(StreamToken(cleaned, done = false))
-                            }
-                        }
-                    )
-                } catch (e: Exception) {
-                    WebViewChatEngine.Result(e.message ?: e.javaClass.simpleName, false)
-                }
+                            if (cleaned.isNotBlank() && cleaned != lastPartial.get()) { lastPartial.set(cleaned); trySend(StreamToken(cleaned, false)) }
+                        })
+                    }
+                } catch (e: Exception) { WebViewChatEngine.Result(e.message ?: e.javaClass.simpleName, false) }
 
-                var text = if (result.ok) {
-                    ReplySanitizer.strip(result.text).ifBlank { result.text }
-                } else {
+                var text = if (result.ok) ReplySanitizer.strip(result.text).ifBlank { result.text } else {
                     val err = result.text
-                    if (looksBlocked(err)) {
-                        ProviderCooldown.markBlocked(context, id, 15)
-                        "$name blocked this session. Cooling down 15m. Switch provider or long-press → Add account."
-                    } else err
+                    if (looksBlocked(err)) { ProviderCooldown.markBlocked(context, id, 15); "$name blocked this session. Cooling down 15m. Switch provider or long-press → Add account." } else err
                 }
+                if (looksBlocked(text)) { ProviderCooldown.markBlocked(context, id, 15); errors += text; continue }
+                if (text.startsWith("Not signed in") || text.contains("input not found", true) || text.contains("No chat input", true)) { errors += "$name: $text"; continue }
 
-                if (looksBlocked(text)) {
-                    ProviderCooldown.markBlocked(context, id, 15)
-                    errors += text
-                    continue
-                }
-                if (text.startsWith("Not signed in") || text.contains("input not found", true) ||
-                    text.contains("No chat input", true)
-                ) {
-                    errors += "$name: $text"
-                    continue
-                }
-
-                // Execute only the explicit <omni_actions> block. Normal model prose
-                // remains normal chat and cannot cause arbitrary filesystem writes.
                 val execution = workspaceAgent.execute(text)
                 if (execution.changed) {
-                    val human = text
-                        .replace(Regex("<omni_actions>[\\s\\S]*?</omni_actions>"), "")
-                        .trim()
-                    text = buildString {
-                        if (human.isNotBlank()) append(human).append("\n\n")
-                        append("✓ ").append(execution.summary)
-                    }
+                    val human = text.replace(Regex("<omni_actions>[\\s\\S]*?</omni_actions>"), "").trim()
+                    text = buildString { if (human.isNotBlank()) append(human).append("\n\n"); append("✓ ").append(execution.summary) }
                 }
-
-                trySend(StreamToken(text, done = true))
-                close()
-                return@launch
+                trySend(StreamToken(text, true)); close(); return@launch
             }
-            trySend(StreamToken(
-                "All providers failed or are cooling down.\n" +
-                    errors.distinct().take(3).joinToString("\n"),
-                done = true
-            ))
-            close()
+            trySend(StreamToken("All providers failed or are cooling down.\n" + errors.distinct().take(3).joinToString("\n"), true)); close()
         }
-
         awaitClose { job.cancel() }
     }.flowOn(Dispatchers.IO)
 
-    suspend fun chatOnce(
-        context: Context,
-        providerId: String,
-        providerName: String,
-        siteUrl: String,
-        messages: List<ChatMessage>,
-        kind: String = "WEB"
-    ): ChatResponse = withContext(Dispatchers.IO) {
+    suspend fun chatOnce(context: Context, providerId: String, providerName: String, siteUrl: String, messages: List<ChatMessage>, kind: String = "WEB"): ChatResponse = withContext(Dispatchers.IO) {
         var last = ""
-        streamChat(context, providerId, providerName, siteUrl, messages, kind).collect { tok ->
-            if (tok.text.isNotEmpty()) last = tok.text
-        }
+        streamChat(context, providerId, providerName, siteUrl, messages, kind).collect { tok -> if (tok.text.isNotEmpty()) last = tok.text }
         ChatResponse(content = last.ifBlank { "No reply." }, model = providerName, providerId = providerId)
     }
 
-    private fun looksBlocked(text: String): Boolean {
-        val t = text.lowercase()
-        return t.contains("unusual activity") ||
-            t.contains("session expired or blocked") ||
-            (t.contains("cooling down") && t.contains("blocked"))
-    }
-
-    private fun hostOf(url: String): String =
-        try { java.net.URI(url).host ?: url } catch (_: Exception) { url }
+    private fun looksBlocked(text: String): Boolean { val t = text.lowercase(); return t.contains("unusual activity") || t.contains("session expired or blocked") || (t.contains("cooling down") && t.contains("blocked")) }
+    private fun hostOf(url: String): String = try { java.net.URI(url).host ?: url } catch (_: Exception) { url }
 
     private fun cookieHeader(context: Context, providerId: String, vararg hosts: String): String {
         val active = AccountStore.activeAccountId(context, providerId)
-        val sessionKeys = listOf(
-            AccountStore.sessionKey(providerId, active), providerId, "web_$providerId"
-        )
-        val stored = sessionKeys
-            .mapNotNull { SecureStore.getSession(context, it) }
-            .firstOrNull { it.isNotBlank() }
-            .orEmpty()
+        val sessionKeys = listOf(AccountStore.sessionKey(providerId, active), providerId, "web_$providerId")
+        val stored = sessionKeys.mapNotNull { SecureStore.getSession(context, it) }.firstOrNull { it.isNotBlank() }.orEmpty()
         val liveParts = linkedSetOf<String>()
         val cm = try { CookieManager.getInstance() } catch (_: Exception) { null }
-        if (cm != null) {
-            for (h in hosts) for (u in listOf("https://$h", "https://www.$h")) {
-                try {
-                    cm.getCookie(u).orEmpty().split(";").map { it.trim() }
-                        .filter { it.contains("=") }.forEach { liveParts.add(it) }
-                } catch (_: Exception) { }
-            }
-        }
+        if (cm != null) for (h in hosts) for (u in listOf("https://$h", "https://www.$h")) try { cm.getCookie(u).orEmpty().split(";").map { it.trim() }.filter { it.contains("=") }.forEach { liveParts.add(it) } } catch (_: Exception) {}
         val live = liveParts.joinToString("; ")
-        return when {
-            stored.isNotBlank() && live.isNotBlank() -> mergeCookies(stored, live)
-            stored.isNotBlank() -> stored
-            else -> live
-        }
+        return when { stored.isNotBlank() && live.isNotBlank() -> mergeCookies(stored, live); stored.isNotBlank() -> stored; else -> live }
     }
-
-    private fun mergeCookies(a: String, b: String): String {
-        val map = linkedMapOf<String, String>()
-        fun putAll(s: String) {
-            s.split(";").map { it.trim() }.filter { it.contains("=") }.forEach {
-                val i = it.indexOf('=')
-                map[it.substring(0, i)] = it.substring(i + 1)
-            }
-        }
-        putAll(a); putAll(b)
-        return map.entries.joinToString("; ") { "${it.key}=${it.value}" }
-    }
-
-    private fun runMcpAction(
-        context: Context,
-        providerId: String,
-        providerName: String,
-        siteUrl: String,
-        task: String
-    ): String {
-        val cookies = cookieHeader(context, providerId, hostOf(siteUrl))
-        if (cookies.isBlank()) return "Sign in to $providerName first."
-        return "MCP session ready on $providerName. Task: ${task.take(200)}"
-    }
+    private fun mergeCookies(a: String, b: String): String { val map = linkedMapOf<String, String>(); fun putAll(s: String) { s.split(";").map { it.trim() }.filter { it.contains("=") }.forEach { val i = it.indexOf('='); map[it.substring(0, i)] = it.substring(i + 1) } }; putAll(a); putAll(b); return map.entries.joinToString("; ") { "${it.key}=${it.value}" } }
+    private fun runMcpAction(context: Context, providerId: String, providerName: String, siteUrl: String, task: String): String { val cookies = cookieHeader(context, providerId, hostOf(siteUrl)); if (cookies.isBlank()) return "Sign in to $providerName first."; return "MCP session ready on $providerName. Task: ${task.take(200)}" }
 }
 
 object ProviderAuthStore {
     private const val PREFS = "omni_provider_auth"
-
-    fun isSignedIn(context: Context, providerId: String): Boolean {
-        val active = AccountStore.activeAccountId(context, providerId)
-        val keys = listOf(AccountStore.sessionKey(providerId, active), providerId, "web_$providerId")
-        if (keys.any { !SecureStore.getSession(context, it).isNullOrBlank() }) return true
-        return context.getSharedPreferences(PREFS, 0).getBoolean("signed_$providerId", false)
-    }
-
-    fun setSignedIn(context: Context, providerId: String, signed: Boolean) {
-        context.getSharedPreferences(PREFS, 0).edit().putBoolean("signed_$providerId", signed).apply()
-        if (!signed) {
-            SecureStore.clearSession(context, providerId)
-            SecureStore.clearSession(context, "web_$providerId")
-            val active = AccountStore.activeAccountId(context, providerId)
-            if (!active.isNullOrBlank()) SecureStore.clearSession(context, AccountStore.sessionKey(providerId, active))
-            ProviderCooldown.clear(context, providerId)
-        }
-    }
-
-    fun preferredProvider(context: Context): String =
-        context.getSharedPreferences(PREFS, 0).getString("preferred", "auto") ?: "auto"
-
-    fun setPreferredProvider(context: Context, id: String) {
-        context.getSharedPreferences(PREFS, 0).edit().putString("preferred", id).apply()
-    }
+    fun isSignedIn(context: Context, providerId: String): Boolean { val active = AccountStore.activeAccountId(context, providerId); val keys = listOf(AccountStore.sessionKey(providerId, active), providerId, "web_$providerId"); if (keys.any { !SecureStore.getSession(context, it).isNullOrBlank() }) return true; return context.getSharedPreferences(PREFS, 0).getBoolean("signed_$providerId", false) }
+    fun setSignedIn(context: Context, providerId: String, signed: Boolean) { context.getSharedPreferences(PREFS, 0).edit().putBoolean("signed_$providerId", signed).apply(); if (!signed) { SecureStore.clearSession(context, providerId); SecureStore.clearSession(context, "web_$providerId"); val active = AccountStore.activeAccountId(context, providerId); if (!active.isNullOrBlank()) SecureStore.clearSession(context, AccountStore.sessionKey(providerId, active)); ProviderCooldown.clear(context, providerId) } }
+    fun preferredProvider(context: Context): String = context.getSharedPreferences(PREFS, 0).getString("preferred", "auto") ?: "auto"
+    fun setPreferredProvider(context: Context, id: String) { context.getSharedPreferences(PREFS, 0).edit().putString("preferred", id).apply() }
 }
